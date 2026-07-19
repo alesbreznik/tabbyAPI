@@ -1,3 +1,11 @@
+import huggingface_hub
+if not hasattr(huggingface_hub, 'HfFolder'):
+    class MockHfFolder:
+        @classmethod
+        def get_token(cls): return None
+        @classmethod
+        def save_token(cls, token): pass
+    huggingface_hub.HfFolder = MockHfFolder
 """The main tabbyAPI module. Contains the FastAPI server and endpoints."""
 
 # Set this env var for cuda malloc async before torch is initalized
@@ -207,3 +215,4 @@ def entrypoint(
 
 if __name__ == "__main__":
     entrypoint()
+
