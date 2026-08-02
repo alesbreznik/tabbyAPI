@@ -291,7 +291,10 @@ class ExllamaV3Container:
 
                 autosplit_reserve_megabytes = unwrap(kwargs.get("autosplit_reserve"), [96])
 
-                # Reserve VRAM for each GPU
+                # Reserve VRAM for each GPU (pad list to gpu_count)
+                while len(autosplit_reserve_megabytes) < gpu_count:
+                    autosplit_reserve_megabytes.append(0)
+                    
                 self.autosplit_reserve = [value / 1024 for value in autosplit_reserve_megabytes]
 
         if not hardware_supports_exllamav3(gpu_device_list):
