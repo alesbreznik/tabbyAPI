@@ -13,7 +13,7 @@ network:
   host: 127.0.0.1
 
   # The port to host on (default: 5000).
-  port: 5000
+  port: 5001
 
   # Disable HTTP token authentication with requests.
   # WARNING: This will make your instance vulnerable!
@@ -73,12 +73,12 @@ model:
   # An initial model to load.
   # Make sure the model is located in the model directory!
   # REQUIRED: This must be filled out to load a model on startup.
-  model_name: Hermes-3-Llama-3.1-8B-exl3-6.0bpw
+  model_name: gemma-4-26B-A4B-it-exl3
 
   # Names of args to use as a fallback for API load requests (default: []).
   # For example, if you always want cache_mode to be Q4 instead of on the inital model load, add "cache_mode" to this array.
   # Example: ['max_seq_len', 'cache_mode'].
-  use_as_default: ['max_seq_len', 'cache_mode','prompt_template']
+  use_as_default: ['max_seq_len', 'cache_mode', 'prompt_template', 'tool_format']
 
   # Backend to use for this model (auto-detect if not specified)
   # Options: exllamav2, exllamav3
@@ -97,7 +97,7 @@ model:
   # Enable different cache modes for VRAM savings (default: FP16).
   # Possible values for exllamav2: 'FP16', 'Q8', 'Q6', 'Q4'.
   # For exllamav3, specify the pair k_bits,v_bits where k_bits and v_bits are integers from 2-8 (i.e. 8,8).
-  cache_mode: 4,4
+  cache_mode: 6,6
 
   # Load model with tensor parallelism.
   # Falls back to autosplit if GPU split isn't provided.
@@ -159,7 +159,7 @@ model:
   # If a model contains multiple templates in its tokenizer_config.json,
   # set prompt_template to the name of the template you want to use.
   # NOTE: Only works with chat completion message lists!
-  prompt_template: chatml.jinja
+  prompt_template: gemma4.jinja
 
   # Enables vision support if the model supports it. (default: False)
   vision: true
@@ -172,7 +172,7 @@ model:
 
   # Enable reasoning parser (default: False).
   # Do NOT enable this if the model is not a reasoning model (e.g. deepseek-r1 series)
-  reasoning: false
+  reasoning: true
 
   # The start token for reasoning content (default: "<think>")
   reasoning_start_token: "<|channel>thought"
@@ -185,7 +185,7 @@ model:
 
   # Tool format, e.g. 'qwen3_coder'. See docs for supported formats. If left blank,
   # tool calls from the model will not be parsed by the server.
-  tool_format:
+  tool_format: gemma4
 
 # Options for draft models (speculative decoding)
 # This will use more VRAM!
@@ -215,7 +215,7 @@ draft_model:
   # Cache mode for draft models to save VRAM (default: FP16).
   # Possible values for exllamav2: 'FP16', 'Q8', 'Q6', 'Q4'.
   # For exllamav3, specify the pair k_bits,v_bits where k_bits and v_bits are integers from 2-8 (i.e. 8,8).
-  draft_cache_mode: Q6
+  draft_cache_mode: Q4
 
   # Array of VRAM sizes to split between GPUs, in GB (default: []).
   # If this isn't filled in, the draft model is autosplit.
@@ -256,13 +256,13 @@ lora:
 # Install it via "pip install .[extras]"
 embeddings:
   # Directory to look for embedding models (default: models).
-  embedding_model_dir: models
+  embedding_model_dir: 
 
   # Device to load embedding models on (default: cpu).
   # Possible values: cpu, auto, cuda.
   # NOTE: It's recommended to load embedding models on the CPU.
   # If using an AMD GPU, set this value to 'cuda'.
-  embeddings_device: cpu
+  embeddings_device: 
 
   # An initial embedding model to load on the infinity backend.
   embedding_model_name: 
@@ -277,7 +277,7 @@ memory:
   # Enabling this is generally preferable, but it may cause issues with certain
   # workloads. Try disabling it if you experience intermittent OoM errors. If
   # False, Torch will use the allocator defined by the system env
-  cuda_malloc_async: false
+  cuda_malloc_async: true
 
 # Options for development and experimentation
 developer:

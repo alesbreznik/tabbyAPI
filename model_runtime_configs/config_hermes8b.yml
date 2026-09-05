@@ -1,0 +1,56 @@
+network:
+  host: 127.0.0.1
+  port: 5000
+  disable_auth: false
+  disable_fetch_requests: false
+  send_tracebacks: false
+  api_servers: ["OAI"]
+
+logging:
+  log_prompt: false
+  log_generation_params: false
+  log_requests: false
+  log_chat_completion_requests: true
+
+model:
+  model_dir: models
+  inline_model_loading: false
+  use_dummy_models: false
+  dummy_model_names: []
+  model_name: Hermes-3-Llama-3.1-8B-exl3-6.0bpw
+  use_as_default: ['max_seq_len', 'cache_mode', 'prompt_template', 'tool_format']
+  backend: exllamav3
+  max_seq_len: 65536
+  cache_size: 65536
+  cache_mode: 6,6
+  tensor_parallel: false
+  tensor_parallel_backend: native
+  gpu_split_auto: false
+  autosplit_reserve: []
+  gpu_split: []
+  rope_scale: 1.0
+  rope_alpha:
+  chunk_size: 4096
+  output_chunking: true
+  max_batch_size: 2
+  prompt_template: hermes3.jinja
+  vision: false
+  force_enable_thinking: false
+  reasoning: false
+  tool_format: hermes
+
+draft_model:
+  draft_mode: disabled
+
+sampling:
+  override_preset: null
+
+memory:
+  sysmem_recurrent_cache: 4096
+  cuda_malloc_async: true
+
+developer:
+  unsafe_launch: false
+  disable_request_streaming: false
+  realtime_process_priority: false
+  log_level: INFO
