@@ -13,7 +13,7 @@ network:
   host: 127.0.0.1
 
   # The port to host on (default: 5000).
-  port: 5001
+  port: 50011
 
   # Disable HTTP token authentication with requests.
   # WARNING: This will make your instance vulnerable!
@@ -60,7 +60,7 @@ model:
   # Allow direct loading of models from a completion or chat completion request (default: False).
   # This method of loading is strict by default.
   # Enable dummy models to add exceptions for invalid model names.
-  inline_model_loading: false
+  inline_model_loading: true
 
   # Sends dummy model names when the models endpoint is queried. (default: False)
   # Enable this if the client is looking for specific OAI models.
@@ -73,7 +73,7 @@ model:
   # An initial model to load.
   # Make sure the model is located in the model directory!
   # REQUIRED: This must be filled out to load a model on startup.
-  model_name: gemma-4-26B-A4B-it-exl3
+  model_name: "gemma-4-26B-A4B-it-exl3"
 
   # Names of args to use as a fallback for API load requests (default: []).
   # For example, if you always want cache_mode to be Q4 instead of on the inital model load, add "cache_mode" to this array.
@@ -86,13 +86,13 @@ model:
 
   # Max sequence length (default: min(max_position_embeddings, cache_size)).
   # Set to -1 to fetch from the model's config.json
-  max_seq_len: 65536
+  max_seq_len: 131072
 
   # Size of the key/value cache to allocate, in tokens (default: 4096).
   # Must be a multiple of 256.
   # ExllamaV2 note: On AMD GPUs and NVIDIA GPUs older than Ampere, this value
   # is ignored. Please use max_seq_len
-  cache_size: 65536
+  cache_size: 131072
 
   # Enable different cache modes for VRAM savings (default: FP16).
   # Possible values for exllamav2: 'FP16', 'Q8', 'Q6', 'Q4'.
@@ -215,7 +215,7 @@ draft_model:
   # Cache mode for draft models to save VRAM (default: FP16).
   # Possible values for exllamav2: 'FP16', 'Q8', 'Q6', 'Q4'.
   # For exllamav3, specify the pair k_bits,v_bits where k_bits and v_bits are integers from 2-8 (i.e. 8,8).
-  draft_cache_mode: Q4
+  draft_cache_mode: Q6
 
   # Array of VRAM sizes to split between GPUs, in GB (default: []).
   # If this isn't filled in, the draft model is autosplit.

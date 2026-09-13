@@ -1,6 +1,6 @@
 network:
   host: 127.0.0.1
-  port: 5000
+  port: 50010
   disable_auth: false
   disable_fetch_requests: false
   send_tracebacks: false

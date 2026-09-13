@@ -81,10 +81,10 @@ async def load_inline_model(model_name: str, request: Request):
 
     # Error if an invalid key is passed
     # If a dummy model is provided, don't error
-    if get_key_permission(request) != "admin":
+    if get_key_permission(request) not in ("admin", "user"):
         if not is_dummy_model:
             error_message = handle_request_error(
-                f"Unable to switch model to {model_name} because " + "an admin key isn't provided",
+                f"Unable to switch model to {model_name} because " + "a valid API key isn't provided",
                 exc_info=False,
             ).error.message
 
