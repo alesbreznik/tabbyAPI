@@ -1,6 +1,10 @@
 import pathlib
 from common import model
-from endpoints.OAI.types.common import UsageStats
+from endpoints.OAI.types.common import (
+    CompletionTokensDetails,
+    PromptTokensDetails,
+    UsageStats,
+)
 from common.tabby_config import config
 from common.auth import get_key_permission
 from common.logger import xlogger
@@ -21,9 +25,16 @@ def get_usage_stats(
     completion_tokens = generation.get("gen_tokens", 0)
     usage_stats = UsageStats(
         prompt_tokens=prompt_tokens,
+        prompt_tokens_details=PromptTokensDetails(
+            cached_tokens=round(generation.get("cached_tokens") or 0)
+        ),
         prompt_time=generation.get("prompt_time"),
         prompt_tokens_per_sec=generation.get("prompt_tokens_per_sec"),
         completion_tokens=completion_tokens,
+        completion_tokens_details=CompletionTokensDetails(
+            accepted_prediction_tokens=generation.get("draft_accept") or 0,
+            rejected_prediction_tokens=generation.get("draft_reject") or 0,
+        ),
         completion_time=generation.get("gen_time"),
         completion_tokens_per_sec=generation.get("gen_tokens_per_sec"),
         total_tokens=prompt_tokens + completion_tokens,
@@ -46,11 +57,22 @@ def aggregate_usage_stats(usage_stats_list: list[UsageStats]) -> UsageStats:
     total_tokens = prompt_tokens + completion_tokens
     total_time = prompt_time + completion_time
 
+    # n > 1 generations share one prompt, so prompt-side details come from the
+    # first entry while generation-side counters accumulate
     usage_stats = UsageStats(
         prompt_tokens=prompt_tokens,
+        prompt_tokens_details=usl[0].prompt_tokens_details,
         prompt_time=prompt_time,
         prompt_tokens_per_sec=prompt_tokens_per_sec,
         completion_tokens=completion_tokens,
+        completion_tokens_details=CompletionTokensDetails(
+            accepted_prediction_tokens=sum(
+                us.completion_tokens_details.accepted_prediction_tokens for us in usl
+            ),
+            rejected_prediction_tokens=sum(
+                us.completion_tokens_details.rejected_prediction_tokens for us in usl
+            ),
+        ),
         completion_time=completion_time,
         completion_tokens_per_sec=completion_tokens_per_sec,
         total_tokens=total_tokens,
@@ -59,11 +81,33 @@ def aggregate_usage_stats(usage_stats_list: list[UsageStats]) -> UsageStats:
     return usage_stats
 
 
+def _is_loaded_model(model_name: str) -> bool:
+    """
+    True if model_name refers to the currently loaded model, either by its
+    advertised id (the model directory's basename) or as a path. A basename
+    alone is ambiguous in quant-style layouts (<model>/exl3/<bpw>), so paths
+    are compared fully resolved against the model directory.
+    """
+
+    if not (model.container and model.container.loaded):
+        return False
+
+    loaded_model_dir = model.container.model_dir
+    if loaded_model_dir.name == model_name:
+        return True
+
+    requested_path = pathlib.Path(config.model.model_dir) / model_name
+    try:
+        return requested_path.resolve() == loaded_model_dir.resolve()
+    except OSError:
+        return False
+
+
 async def load_inline_model(model_name: str, request: Request):
     """Load a model from the data.model parameter"""
 
     # Return if the model container already exists and the model is fully loaded
-    if model.container and model.container.model_dir.name == model_name and model.container.loaded:
+    if _is_loaded_model(model_name):
         return
 
     # Return if inline loading is disabled
@@ -103,14 +147,28 @@ async def load_inline_model(model_name: str, request: Request):
     model_path = pathlib.Path(config.model.model_dir)
     model_path = model_path / model_name
 
-    # Model path doesn't exist
+    # A request that names a model it can't get must fail rather than run on
+    # whatever happens to be loaded: the client asked for a specific model, and
+    # an answer from a different one is wrong in a way it cannot detect
     if not model_path.exists():
-        xlogger.warning(f"Could not find model path {str(model_path)}. Skipping inline model load.")
+        error_message = handle_request_error(
+            f"Model {model_name} was not found in the model directory.",
+            exc_info=False,
+        ).error.message
 
-        return
+        raise HTTPException(404, error_message)
 
     # Load the model and also add draft dir
-    await model.load_model(
-        model_path,
-        draft_model=config.draft_model.model_dump(include={"draft_model_dir"}),
-    )
+    try:
+        await model.load_model(
+            model_path,
+            draft_model=config.draft_model.model_dump(include={"draft_model_dir"}),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        error_message = handle_request_error(
+            f"Model {model_name} failed to load: {exc}"
+        ).error.message
+
+        raise HTTPException(503, error_message) from exc

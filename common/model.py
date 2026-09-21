@@ -14,6 +14,7 @@ from common.logger import get_loading_progress_bar
 from common.multimodal import MultimodalEmbeddingWrapper
 from common.networking import handle_request_error
 from common.sampling import BaseSamplerRequest
+from common.status_display import status_display
 from common.tabby_config import config
 from common.optional_dependencies import dependencies
 from common.transformers_utils import HFModel
@@ -31,10 +32,17 @@ embeddings_container = None
 load_lock = asyncio.Lock()
 
 
+# A broken infinity-emb install (e.g. missing transitive dependencies) only
+# disables embeddings instead of preventing server startup
+_extras_import_error: Optional[str] = None
 if dependencies.extras:
-    from backends.infinity.model import InfinityContainer
+    try:
+        from backends.infinity.model import InfinityContainer
 
-    embeddings_container: Optional[InfinityContainer] = None
+        embeddings_container: Optional[InfinityContainer] = None
+    except Exception as exc:
+        _extras_import_error = str(exc)
+        xlogger.warning(f"Embeddings are disabled because infinity-emb failed to import: {exc}")
 
 
 class ModelType(Enum):
@@ -141,12 +149,15 @@ async def load_model_gen(model_path: pathlib.Path, **kwargs):
     global container
 
     async with load_lock:
-        # Check if the model is already loaded
+        # Check if the model is already loaded. Compare full resolved paths:
+        # quant-style layouts give unrelated models the same directory
+        # basename (e.g. <model_a>/exl3/4.00bpw vs <model_b>/exl3/4.00bpw),
+        # and a name comparison would silently skip the swap.
         if container and container.model:
-            loaded_model_name = container.model_dir.name
+            loaded_model_dir = container.model_dir
 
-            if loaded_model_name == model_path.name and container.loaded:
-                xlogger.info(f'Model "{loaded_model_name}" is already loaded')
+            if loaded_model_dir.resolve() == model_path.resolve() and container.loaded:
+                xlogger.info(f'Model "{loaded_model_dir.name}" is already loaded')
 
                 # Emit a terminal progress event so API clients always
                 # see a "finished" status even when no load was needed
@@ -193,32 +204,33 @@ async def load_model_gen(model_path: pathlib.Path, **kwargs):
 
         load_status = new_container.load_gen(load_progress, **kwargs)
 
-        progress = get_loading_progress_bar()
-        progress.start()
+        # The live status line must not be showing while the loading bars run
+        async with status_display.suspended():
+            progress = get_loading_progress_bar()
+            progress.start()
 
-        try:
-            index = 0
-            async for module, modules in load_status:
-                current_model_type = model_type[index].value
-                if module == 0:
-                    loading_task = progress.add_task(
-                        f"[cyan]Loading {current_model_type} modules", total=modules
-                    )
-                else:
-                    progress.advance(loading_task)
-
-                yield module, modules, current_model_type
-
-                if module == modules:
-                    # Switch to model progress if the draft model is loaded
-                    if index == len(model_type):
-                        progress.stop()
+            try:
+                index = 0
+                async for module, modules in load_status:
+                    current_model_type = model_type[index].value
+                    if module == 0:
+                        loading_task = progress.add_task(
+                            f"[cyan]Loading {current_model_type} modules", total=modules
+                        )
                     else:
-                        index += 1
+                        progress.advance(loading_task)
 
-            container = new_container
-        finally:
-            progress.stop()
+                    yield module, modules, current_model_type
+
+                    if module == modules:
+                        # Move on to the next component; the last one ends the bars
+                        index += 1
+                        if index == len(model_type):
+                            progress.stop()
+
+                container = new_container
+            finally:
+                progress.stop()
 
 
 async def load_model(model_path: pathlib.Path, **kwargs):
@@ -251,12 +263,20 @@ async def load_embedding_model(model_path: pathlib.Path, **kwargs):
             "pip install -U .[extras]"
         )
 
-    # Check if the model is already loaded
-    if embeddings_container and embeddings_container.engine:
-        loaded_model_name = embeddings_container.model_dir.name
+    # Break out if infinity is installed but not importable
+    if _extras_import_error is not None:
+        raise ImportError(
+            f"Embeddings are disabled because infinity-emb failed to import: {_extras_import_error}"
+        )
 
-        if loaded_model_name == model_path.name and embeddings_container.loaded:
-            raise ValueError(f'Embeddings model "{loaded_model_name}" is already loaded! Aborting.')
+    # Check if the model is already loaded (by full path, same as load_model_gen)
+    if embeddings_container and embeddings_container.engine:
+        loaded_model_dir = embeddings_container.model_dir
+
+        if loaded_model_dir.resolve() == model_path.resolve() and embeddings_container.loaded:
+            raise ValueError(
+                f'Embeddings model "{loaded_model_dir.name}" is already loaded! Aborting.'
+            )
 
         xlogger.info("Unloading existing embeddings model.")
         await unload_embedding_model()

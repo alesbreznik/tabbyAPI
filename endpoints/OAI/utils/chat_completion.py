@@ -18,6 +18,7 @@ from common.networking import (
     get_context_length_generator_error,
     get_generator_error,
     handle_request_error,
+    request_tag,
     DisconnectHandler,
 )
 from common.utils import unwrap
@@ -30,10 +31,11 @@ from endpoints.OAI.types.chat_completion import (
     ChatCompletionResponse,
 )
 from endpoints.OAI.types.common import UsageStats
-from endpoints.OAI.utils.completion import _parse_gen_request_id
+from endpoints.OAI.utils.completion import _gen_label, _parse_gen_request_id
 from endpoints.OAI.utils.stream_parser import (
     CONTENT,
     REASONING,
+    GlimmerStreamParser,
     HarmonyStreamParser,
     TagStreamParser,
 )
@@ -108,9 +110,9 @@ def _resolve_start_in_reasoning(prompt: str, data: ChatCompletionRequest) -> boo
     """Determine whether generation starts inside a reasoning block."""
 
     mc = model.container
-    if mc.harmony:
-        # Harmony message headers determine the channel; there is no
-        # ambiguity for the parser to resolve
+    if mc.harmony or mc.muse_glimmer:
+        # Harmony and Glimmer message headers determine the channel; there
+        # is no ambiguity for the parser to resolve
         return False
     if not mc.reasoning:
         return False
@@ -260,6 +262,34 @@ def _compose_serialize_stream_usage_chunk(
     return s, data
 
 
+def _sort_tool_messages(message_dicts: List[dict]):
+    """Reorder tool-result messages to match the tool call order.
+
+    Clients may return parallel tool results in any order; some templates
+    (e.g. DeepSeek-V4) render results positionally and require them in the
+    order of the corresponding assistant tool_calls. Sorts each consecutive
+    run of tool messages after an assistant message in place, matching by
+    tool_call_id. Results with unknown IDs keep their relative order at the
+    end of the run.
+    """
+
+    i = 0
+    while i < len(message_dicts):
+        msg = message_dicts[i]
+        i += 1
+        if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+            continue
+
+        order = {tc["id"]: idx for idx, tc in enumerate(msg["tool_calls"]) if tc.get("id")}
+        run_start = i
+        while i < len(message_dicts) and message_dicts[i].get("role") == "tool":
+            i += 1
+        if i - run_start > 1 and order:
+            run = message_dicts[run_start:i]
+            run.sort(key=lambda m: order.get(m.get("tool_call_id"), len(order)))
+            message_dicts[run_start:i] = run
+
+
 async def format_messages_with_template(
     messages: List[ChatCompletionMessage],
     existing_template_vars: Optional[dict] = None,
@@ -305,6 +335,10 @@ async def format_messages_with_template(
                             "string to dict, keeping as string",
                             {"args": args},
                         )
+
+    # Sort parallel tool results into tool call order for templates that
+    # render them positionally
+    _sort_tool_messages(message_dicts)
 
     # Get all special tokens
     special_tokens_dict = model.container.get_special_tokens()
@@ -404,10 +438,9 @@ def resolve_template_vars(data: ChatCompletionRequest, container) -> dict:
 
     request_vars = {}
 
-    # OpenRouter / OpenAI Responses style reasoning object
+    # OpenRouter / OpenAI Responses style reasoning object;
+    # reasoning.max_tokens is consumed by _resolve_reasoning_budget instead
     if data.reasoning is not None:
-        if data.reasoning.max_tokens is not None:
-            xlogger.debug("reasoning.max_tokens is not supported; ignoring.")
         if data.reasoning.enabled is not None:
             request_vars["enable_thinking"] = data.reasoning.enabled
         if data.reasoning.effort is not None:
@@ -430,11 +463,25 @@ def resolve_template_vars(data: ChatCompletionRequest, container) -> dict:
     }
 
 
+def normalize_message_roles(data: ChatCompletionRequest):
+    """
+    Map the OpenAI "developer" role onto "system". Most chat templates only know
+    system/user/assistant/tool and raise on anything else; the templates that do
+    handle "developer" (Harmony) treat it the same as system.
+    """
+
+    for message in data.messages:
+        if message.role == "developer":
+            message.role = "system"
+
+
 async def apply_chat_template(data: ChatCompletionRequest):
     """
     Compile the prompt and get any additional stop strings from the template.
     Template stop strings can be overriden by sampler overrides if force is true.
     """
+
+    normalize_message_roles(data)
 
     # Locally store tools dict
     tools = data.model_dump()["tools"]
@@ -493,7 +540,11 @@ async def apply_chat_template(data: ChatCompletionRequest):
 
         raise HTTPException(400, error_message) from exc
     except TemplateError as exc:
-        error_message = handle_request_error(f"TemplateError: {str(exc)}").error.message
+        # The template rejected the request (e.g. an unsupported reasoning_effort),
+        # which is a client error rather than a server fault, so no traceback
+        error_message = handle_request_error(
+            f"TemplateError: {str(exc)}", exc_info=False
+        ).error.message
 
         raise HTTPException(400, error_message) from exc
 
@@ -501,7 +552,7 @@ async def apply_chat_template(data: ChatCompletionRequest):
 def _parse_tool_calls(
     text: str,
     tool_format: str,
-    request_id: str,
+    label: str,
 ) -> list:
     """
     Parse collected tool calls and convert to OAI format.
@@ -517,12 +568,55 @@ def _parse_tool_calls(
     dumped = [p.model_dump(mode="json") for p in parsed]
 
     if len(parsed):
+        num = len(parsed)
         xlogger.info(
-            f"Parsed {len(parsed)} tool calls in chat completion request {request_id}",
+            f"{label}: parsed {num} tool call{'' if num == 1 else 's'} ({tool_format})",
             {"tool_format": tool_format, "parsed": parsed, "dumped": dumped},
-            details=f"(format={tool_format})",
         )
     return dumped
+
+
+def _resolve_reasoning_budget(data: ChatCompletionRequest, mc) -> tuple[Optional[int], str]:
+    """
+    Resolve the reasoning token budget and forced message from the request and
+    model config. Following llama.cpp, a negative budget at any level means
+    "unset" and defers to the next source; the resolved budget is either None
+    (unlimited) or >= 0.
+    """
+
+    def normalize(budget):
+        return None if budget is None or budget < 0 else budget
+
+    budget = normalize(data.reasoning_budget_tokens)
+    if budget is None and data.reasoning is not None:
+        budget = normalize(data.reasoning.max_tokens)
+    if budget is None:
+        budget = normalize(mc.reasoning_budget_tokens)
+
+    message = data.reasoning_budget_message
+    if message is None:
+        message = mc.reasoning_budget_message
+
+    return budget, message or ""
+
+
+def _reasoning_budget_injection(mc, message: str) -> Optional[str]:
+    """
+    Text forced into the output stream to end the reasoning phase: the budget
+    message followed by the tokens that transition the active reasoning format
+    to final content. None if the model has no reasoning format to end.
+    """
+
+    if mc.harmony:
+        suffix = "<|end|><|start|>assistant<|channel|>final<|message|>"
+    elif mc.muse_glimmer:
+        suffix = "<|eom|><|start|>assistant to=user<|message|>"
+    elif mc.reasoning and mc.reasoning_start_token and mc.reasoning_end_token:
+        suffix = mc.reasoning_end_token
+    else:
+        return None
+
+    return message + suffix
 
 
 async def _chat_stream_collector(
@@ -535,6 +629,7 @@ async def _chat_stream_collector(
     mm_embeddings: Optional[MultimodalEmbeddingWrapper] = None,
     streaming_mode: bool = True,
     disconnect_handler: DisconnectHandler = None,
+    label: Optional[str] = None,
 ):
     """
     Starts a request on the backend and collects generations while tracking phase, for a single
@@ -550,6 +645,7 @@ async def _chat_stream_collector(
     """
 
     mc = model.container
+    label = label or f"request {request_id}"
     full_reasoning = ""
     full_content = ""
     full_tool = ""
@@ -560,6 +656,11 @@ async def _chat_stream_collector(
         tool_format = "harmony"
         use_think = False
         parser = HarmonyStreamParser()
+    elif mc.muse_glimmer:
+        # Same for Muse Glimmer, with recipients in place of channels
+        tool_format = "muse_glimmer"
+        use_think = False
+        parser = GlimmerStreamParser()
     else:
         tool_format = mc.tool_format
         t_tool_start, t_tool_end = get_toolcall_tags(tool_format)
@@ -576,6 +677,28 @@ async def _chat_stream_collector(
             tool_calls_in_reasoning=mc.tool_calls_in_reasoning,
         )
 
+    # Reasoning budget: when the reasoning phase exceeds the budget, force
+    # end-of-reasoning tokens into the output stream so the model answers
+    # with what it has. The injected text arrives as regular output, so the
+    # parser transitions out of reasoning on its own.
+    budget, budget_message = _resolve_reasoning_budget(params, mc)
+    budget_injection = None
+    if budget is not None:
+        budget_injection = _reasoning_budget_injection(mc, budget_message)
+        if budget_injection is None:
+            xlogger.debug(
+                "A reasoning budget was requested but the model has no reasoning format; ignoring."
+            )
+        elif params.json_schema or params.regex_pattern or params.grammar_string:
+            # Injection permanently disables a job's filters
+            xlogger.warning(
+                "The reasoning budget is ignored because the request uses "
+                "constrained generation (json_schema, regex_pattern or "
+                "grammar_string)."
+            )
+            budget_injection = None
+    reasoning_tokens = 0
+
     # Collect logprobs
     collected_logprobs = []
 
@@ -589,6 +712,7 @@ async def _chat_stream_collector(
             filter_trigger=(
                 mc.reasoning_end_token if use_think and start_in_reasoning_mode else None
             ),
+            label=label,
         )
         generation = {"index": task_idx}
         async for generation in new_generation:
@@ -612,6 +736,22 @@ async def _chat_stream_collector(
                 else:
                     full_tool += sub
 
+            # Count reasoning tokens and force the end of the reasoning phase
+            # when the budget is exhausted. Attribution is approximate: a
+            # chunk counts as reasoning if the parser is still in reasoning
+            # after consuming it, and the injection lands a few tokens late
+            # (tokens sampled ahead of this consumer precede it).
+            if budget_injection is not None and parser.in_reasoning and not parser.in_tool:
+                reasoning_tokens += len(generation.get("token_ids") or [])
+                if reasoning_tokens >= budget:
+                    if mc.constrain_generation_output(request_id, budget_injection):
+                        xlogger.debug(
+                            f"Reasoning budget of {budget} tokens exhausted; "
+                            "forcing the end of the reasoning phase.",
+                            {"injection": budget_injection},
+                        )
+                    budget_injection = None
+
             # Collect logprobs in content span only, skipping chunks that
             # contain a phase transition
             if "logprobs_content" in generation and not parser.saw_tag and parser.in_content:
@@ -619,6 +759,17 @@ async def _chat_stream_collector(
 
             # Add the output and emit
             if streaming_mode:
+                # A chunk can span the end of the reasoning phase (merged
+                # generator results). Emit the reasoning tail as its own
+                # delta so no SSE frame carries both reasoning_content and
+                # content: clients treat the first content delta as the
+                # phase transition.
+                if delta_reasoning and delta_content:
+                    await gen_queue.put(
+                        {"index": task_idx, "delta_reasoning_content": delta_reasoning}
+                    )
+                    delta_reasoning = ""
+
                 if delta_content:
                     if len(collected_logprobs):
                         generation["logprob_response"] = ChatCompletionLogprobs(
@@ -630,7 +781,7 @@ async def _chat_stream_collector(
                 generation["delta_tool_calls"] = ""
                 if finish_reason and full_tool:
                     generation["delta_tool_calls"] = _parse_tool_calls(
-                        full_tool, tool_format, request_id
+                        full_tool, tool_format, label
                     )
                     generation["finish_reason"] = "tool_calls"
                 await gen_queue.put(generation)
@@ -646,7 +797,7 @@ async def _chat_stream_collector(
                 generation["logprob_response"] = ChatCompletionLogprobs(content=collected_logprobs)
             generation["reasoning_content"] = full_reasoning
             generation["content"] = full_content if has_content else None
-            generation["tool_calls"] = _parse_tool_calls(full_tool, tool_format, request_id)
+            generation["tool_calls"] = _parse_tool_calls(full_tool, tool_format, label)
             if full_tool:
                 generation["finish_reason"] = "tool_calls"
             return generation
@@ -675,9 +826,10 @@ async def stream_generate_chat_completion(
     return_usage = data.stream_options and data.stream_options.include_usage
 
     try:
-        xlogger.info(
-            f"Received chat completion streaming request {request.state.id}",
+        xlogger.debug(
+            f"{request_tag(request)} chat completion (stream) payload, ID {request.state.id}",
             {
+                "request_id": request.state.id,
                 "prompt": prompt,
                 "data": data.model_dump(mode="json"),
                 "model_path": str(model_path),
@@ -706,6 +858,7 @@ async def stream_generate_chat_completion(
                     mm_embeddings=embeddings,
                     streaming_mode=True,
                     disconnect_handler=disconnect_handler,
+                    label=_gen_label(request, "chat/completions", data.n, idx, True),
                 )
             )
             gen_tasks.append(gen_task)
@@ -749,7 +902,7 @@ async def stream_generate_chat_completion(
 
             # Check if all tasks are completed
             if all(task.done() for task in gen_tasks) and gen_queue.empty():
-                xlogger.info(f"Finished chat completion streaming request {request.state.id}")
+                xlogger.debug(f"{request_tag(request)} chat completion stream finished")
                 yield "[DONE]"
                 break
 
@@ -779,9 +932,10 @@ async def generate_chat_completion(
     return_usage = data.stream_options and data.stream_options.include_usage
 
     try:
-        xlogger.info(
-            f"Received chat completion request {request.state.id}",
+        xlogger.debug(
+            f"{request_tag(request)} chat completion payload, ID {request.state.id}",
             {
+                "request_id": request.state.id,
                 "prompt": prompt,
                 "data": data.model_dump(mode="json"),
                 "model_path": str(model_path),
@@ -806,6 +960,7 @@ async def generate_chat_completion(
                     mm_embeddings=embeddings,
                     streaming_mode=False,
                     disconnect_handler=disconnect_handler,
+                    label=_gen_label(request, "chat/completions", data.n, idx, False),
                 )
             )
             gen_tasks.append(gen_task)
@@ -821,7 +976,7 @@ async def generate_chat_completion(
             generations.append(r)
         response = _compose_response(request.state.id, generations, model_path.name, return_usage)
 
-        xlogger.info(f"Finished chat completion request {request.state.id}", {"response": response})
+        xlogger.debug(f"{request_tag(request)} chat completion finished", {"response": response})
         return response
 
     except CancelledError:
@@ -833,7 +988,7 @@ async def generate_chat_completion(
 
     except Exception as exc:
         error_message = handle_request_error(
-            f"Chat completion {request.state.id} aborted. Maybe the model was unloaded? "
+            f"{request_tag(request)} chat completion aborted. Maybe the model was unloaded? "
             "Please check the server console."
         ).error.message
 

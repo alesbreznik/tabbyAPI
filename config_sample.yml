@@ -17,8 +17,17 @@ network:
 
   # Disable HTTP token authentication with requests.
   # WARNING: This will make your instance vulnerable!
-  # Turn on this option if you are ONLY connecting from localhost.
+  # Only turn this on if nothing but trusted local clients can reach the API.
+  # Note that web pages open in a browser on this machine also count as local
+  # callers; restrict allowed_origins below if you disable auth.
   disable_auth: false
+
+  # Origins allowed to call the API from a browser (default: ["*"]).
+  # This is a CORS allowlist, not authentication: "*" lets any site open in your
+  # browser send requests to this instance, which matters most when disable_auth
+  # is on. Restrict to your own frontends (e.g. ["http://localhost:8000"]) or use
+  # an empty list [] to block all browser (cross-origin) callers.
+  allowed_origins: ["*"]
 
   # Disable fetching external content in response to requests,such as images from URLs.
   disable_fetch_requests: false
@@ -36,6 +45,10 @@ network:
   # connections from dropping during long prefills. Set to 0 to disable.
   sse_ping_interval: 15
 
+  # Log every HTTP request with client address, method, path and status (default: False).
+  # Generation requests are already logged in detail; this adds the rest, such as model list and health polls.
+  access_log: false
+
 # Options for logging
 logging:
   # Enable prompt logging (default: False).
@@ -48,7 +61,17 @@ logging:
   # NOTE: Only use this for debugging!
   log_requests: false
 
+  # Show a live status line below the log with cache usage and in-flight jobs (default: True).
+  # Only shown on an interactive terminal.
+  log_live_status: true
+
+  # Prefix console log lines with the time of day (default: True).
+  # The log files under logs/ always carry full timestamps.
+  log_timestamps: true
+
   # Write every /v1/chat/completions request to logs/debug/ as JSON (default: False).
+  # Also saves the fully templated prompt (the exact text sent to the tokenizer)
+  # as a .txt file with the same basename.
   # PRIVACY WARNING: Enabling this creates a comprehensive request log, including the
   # full message history and generation parameters. API keys are redacted, but prompts
   # and user-provided content are preserved for bug-report reproduction.
@@ -63,8 +86,9 @@ model:
   model_dir: models
 
   # Allow direct loading of models from a completion or chat completion request (default: False).
-  # This method of loading is strict by default.
-  # Enable dummy models to add exceptions for invalid model names.
+  # This method of loading is strict: a request naming a model that doesn't exist or fails to load
+  # is rejected instead of running on the loaded model. Enable dummy models to add exceptions for
+  # model names that clients send without meaning a specific model.
   inline_model_loading: false
 
   # Sends dummy model names when the models endpoint is queried. (default: False)
@@ -117,13 +141,40 @@ model:
   # Not parsed for single GPU users.
   gpu_split_auto: true
 
-  # Reserve VRAM used for autosplit loading (default: 96 MB on GPU 0).
+  # Reserve VRAM used when loading a model (default: 96 MB on GPU 0).
   # Represented as an array of MB per GPU.
+  # A negative value excludes that GPU from the model split, so
+  # excluding every GPU will fail to load.
+  # Ignored for a model whose placement is already set by gpu_split
+  # or draft_gpu_split.
   autosplit_reserve: [96]
 
   # Array of VRAM sizes to split between GPUs, in GB (default: []).
-  # Used with tensor parallelism.
+  # Used both with and without tensor parallelism.
   gpu_split: []
+
+  # Number of mixture-of-expert layers to offload to CPU inference (default: 0)
+  # Only affects MoE models. Set a large value such as 999 to offload all layers
+  # Mutually exclusive with cpu_moe_split_experts.
+  cpu_moe_offload_layers:
+
+  # Number of routed experts per MoE layer to offload to CPU inference (default: 0).
+  # Unlike cpu_moe_offload_layers, this splits every MoE layer instead of offloading whole
+  # layers: the coldest experts are kept in system RAM and computed on the CPU, overlapping
+  # each layer's own GPU compute, with dynamic placement keeping hot experts in VRAM.
+  # Mutually exclusive with cpu_moe_offload_layers; not supported with tensor parallelism.
+  cpu_moe_split_experts:
+
+  # Worker thread count for CPU MoE inference (default: None).
+  # Applies to both cpu_moe_offload_layers and cpu_moe_split_experts. When unset,
+  # defers to the EXL3_MOE_CPU_THREADS environment variable, then half the CPU core count.
+  cpu_moe_threads:
+
+  # Load a model's n-gram embedding table fully into system RAM (default: False).
+  # Only affects PLE models with n-gram embeddings (e.g. Qwen3.8-Flash-Next). By default
+  # the table is streamed from disk during inference; loading it into RAM avoids
+  # per-token disk reads at the cost of tens of GB of system memory.
+  ngram_ram: false
 
   # NOTE: If a model has YaRN rope scaling, it will automatically be enabled by ExLlama.
   # rope_scale and rope_alpha settings won't apply in this case.
@@ -157,6 +208,26 @@ model:
   # can reduce it further to minimize VRAM overhead.
   max_batch_size:
 
+  # Tokens between recurrent state checkpoints near the end of the prompt and
+  # during generation (default: None, the engine's per-architecture default,
+  # 2048 for most models). Only used by models with recurrent (linear or sliding
+  # attention) layers. Must be a multiple of 256.
+  recurrent_checkpoint_interval:
+
+  # Tokens between recurrent state checkpoints during prompt ingestion, further
+  # than 2 * chunk_size from the end of the prompt (default: None, the engine
+  # default of 32768). Only used by models with recurrent layers. Must be a
+  # multiple of 256 and is rounded up to a multiple of chunk_size.
+  # Recurrent states cannot be rolled back, so a request that edits an earlier
+  # part of a cached prompt replays from the last checkpoint before the edit.
+  # With the default, a long prompt is only checkpointed near its end and an
+  # early edit costs a full re-prefill; with a denser grid the replay cost becomes
+  # proportional to the distance from the edit to the end of the prompt.
+  # Each checkpoint costs one recurrent state of system RAM (148 MiB for a 27B
+  # hybrid with 48 recurrent layers), bounded by memory.sysmem_recurrent_cache,
+  # and cold prefill is 2-3% slower at 2048 or 1024.
+  recurrent_checkpoint_interval_pp:
+
   # Set the prompt template for this model. (default: None)
   # If empty, attempts to look for the model's chat template.
   # If a model contains multiple templates in its tokenizer_config.json,
@@ -166,6 +237,11 @@ model:
 
   # Enables vision support if the model supports it. (default: False)
   vision: false
+
+  # Keep the vision model's weights in system RAM instead of VRAM (default: False).
+  # Weights are stored in pinned host memory and streamed to the GPU during inference,
+  # trading vision speed for VRAM. Only applies when vision is enabled.
+  vision_offload: false
 
   # Default chat template variables (default: {}).
   # Merged into the template variables of every chat completion request; values
@@ -199,6 +275,20 @@ model:
   # If False, tool call tags inside a reasoning block are treated as plain reasoning text.
   tool_calls_in_reasoning: true
 
+  # Default reasoning token budget (default: None).
+  # When a request's reasoning content exceeds the budget, the server forces the end of
+  # the reasoning phase by injecting reasoning_budget_message followed by the model's
+  # end-of-reasoning tokens. 0 ends reasoning as soon as it starts; None or a negative
+  # value disables the budget. Overridable per request via reasoning_budget_tokens
+  # (aliases: reasoning_budget, thinking_budget, thinking_token_budget) or
+  # reasoning.max_tokens. Requires a reasoning format: reasoning tags, Harmony or Muse Glimmer.
+  reasoning_budget_tokens:
+
+  # Text injected before the end-of-reasoning tokens when the reasoning budget is
+  # exhausted (default: no text, only the end-of-reasoning tokens are forced). Also overridable
+  # per request via reasoning_budget_message.
+  reasoning_budget_message:
+
   # Tool format, e.g. 'qwen3_coder'. See docs for supported formats. If left blank,
   # tool calls from the model will not be parsed by the server.
   tool_format:
@@ -208,6 +298,12 @@ model:
   # to override. Setting 'tool_format: harmony' is equivalent to setting this to true.
   # When active, supersedes the reasoning and tool format settings.
   harmony:
+
+  # Parse responses in the Muse Glimmer message format.
+  # Auto-detected from the model's special tokens by default; set to true or false
+  # to override. Setting 'tool_format: muse_glimmer' is equivalent to setting this to true.
+  # When active, supersedes the reasoning and tool format settings.
+  muse_glimmer:
 
 # Options for draft models (speculative decoding)
 # This will use more VRAM!
@@ -249,6 +345,10 @@ draft_model:
   # (e.g. DFlash with 15 tokens by default) shorter drafts may be preferable.
   draft_num_tokens:
 
+  # Adjust number of draft tokens dynamically based on observed acceptance rates (default: False)
+  # Ceiling is given by num_draft_tokens.
+  dynamic_draft:
+
   # Minimum match length for exllamav3 n-gram drafting (default: 2).
   # Only used when draft_mode is ngram.
   ngram_match_min: 2
@@ -259,7 +359,7 @@ sampling:
   # Find this in the sampler-overrides folder.
   # This overrides default fallbacks for sampler values that are passed to the API.
   # NOTE: safe_defaults is noob friendly and provides fallbacks for frontends that don't send sampling parameters.
-  # Remove this for any advanced usage.
+  # for frontends that don't send sampling parameters. Leaving this blank means no fallbacks at all.
   override_preset: safe_defaults
 
 # Options for Loras
@@ -295,11 +395,20 @@ memory:
   # Max size of recurrent cache in system memory, in MB (default: 4096)
   sysmem_recurrent_cache: 4096
 
-  # Use cudaMallocAsync backend in Torch (default: True).
-  # Enabling this is generally preferable, but it may cause issues with certain
-  # workloads. Try disabling it if you experience intermittent OoM errors. If
-  # False, Torch will use the allocator defined by the system env
-  cuda_malloc_async: True
+  # Size of system memory second-tier K/V cache, in MB (default: 0)
+  sysmem_kv_cache: 0
+
+  # Size of the image embedding cache in system memory, in MB (default: 1024).
+  # Encoded images are kept so repeated turns of a conversation don't re-run the vision model.
+  # Images already in use by a request are never evicted; a context whose images exceed the
+  # budget is cached only partially, with a warning. Only applies when vision is enabled.
+  sysmem_multimodal_cache: 1024
+
+  # Use the cudaMallocAsync allocator backend in Torch (default: False).
+  # When False, the allocator is left to the environment: unless PYTORCH_CUDA_ALLOC_CONF is set,
+  # ExLlamaV3 enables expandable segments in Torch's native allocator, which performs better
+  # than cudaMallocAsync. Enable this to force the cudaMallocAsync backend instead.
+  cuda_malloc_async: false
 
 # Options for development and experimentation
 developer:

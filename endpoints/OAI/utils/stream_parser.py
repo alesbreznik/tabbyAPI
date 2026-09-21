@@ -8,6 +8,30 @@ CONTENT = "content"
 TOOL = "tool"
 
 
+def _partial_token_len(
+    pending: str, tokens: list[str], first_chars: frozenset, max_hold: int
+) -> int:
+    """
+    Length of the longest suffix of `pending` that is a proper prefix of one of `tokens`.
+
+    Only suffixes starting with a token's first character can qualify, so scan the tail
+    for those positions (longest suffix first) instead of testing every suffix length.
+    """
+
+    limit = min(max_hold, len(pending))
+    if not limit:
+        return 0
+
+    tail = pending[-limit:]
+    for pos, ch in enumerate(tail):
+        if ch in first_chars:
+            suffix = tail[pos:]
+            for token in tokens:
+                if token.startswith(suffix):
+                    return len(suffix)
+    return 0
+
+
 class TagStreamParser:
     """
     Splits a stream of generated text into reasoning/content/tool channels by
@@ -56,6 +80,7 @@ class TagStreamParser:
         self._tags = tags
         self._tag_re = re.compile("|".join(re.escape(t) for t in tags)) if tags else None
         self._max_hold = max((len(t) - 1 for t in tags), default=0)
+        self._tag_first = frozenset(t[0] for t in tags)
 
     @property
     def in_content(self) -> bool:
@@ -98,13 +123,7 @@ class TagStreamParser:
     def _partial_tag_len(self) -> int:
         """Length of the longest pending suffix that could still become a tag."""
 
-        limit = min(self._max_hold, len(self._pending))
-        for k in range(limit, 0, -1):
-            tail = self._pending[-k:]
-            for tag in self._tags:
-                if tag.startswith(tail):
-                    return k
-        return 0
+        return _partial_token_len(self._pending, self._tags, self._tag_first, self._max_hold)
 
     def _route(self, text: str, events: list):
         """Append text to the currently active channel."""
@@ -158,34 +177,35 @@ class TagStreamParser:
             self.in_tool = False
 
 
-class HarmonyStreamParser:
+class ChannelStreamParser:
     """
-    Splits generated text in the Harmony format (gpt-oss) into
-    reasoning/content/tool channels.
+    Base for formats that structure the whole response — reasoning, content
+    and tool calls — as a sequence of messages `{header}<|message|>{body}`,
+    where the header determines the channel and any other structural token
+    ends the body and opens the next header. Generation begins after the
+    prompt's `<|start|>assistant`, so parsing starts inside a message header.
 
-    Generation begins after the prompt's `<|start|>assistant`, so parsing
-    starts inside a message header. Each message is `{header}<|message|>{body}`
-    where the body ends with `<|end|>` (another message follows), `<|return|>`
-    (end of the response) or `<|call|>` (tool call). The header carries the
-    channel and, for tool calls, a recipient:
-
-        <|channel|>analysis<|message|>...reasoning...<|end|>
-        <|start|>assistant<|channel|>final<|message|>...content...<|return|>
-        <|channel|>commentary to=functions.name <|constrain|>json<|message|>{...}<|call|>
-
-    Routing: analysis -> reasoning, final -> content, commentary with a
-    recipient -> tool, commentary without one (a user-visible preamble)
-    -> content.
+    Subclasses define the structural tokens (_TOKENS, which must include
+    `<|message|>`), the terminator appended to emitted tool messages
+    (_TOOL_END) and the header-to-channel mapping (_resolve_channel).
 
     Tool messages are emitted on the tool channel as
-    `{header}<|message|>{body}<|call|>`, to be parsed with the "harmony" tool
-    format. `<|return|>` and `<|call|>` are stop tokens, so the delimiter that
-    ends the last message usually never arrives in the text; finish() closes
-    an open tool message.
+    `{header}<|message|>{body}{_TOOL_END}`, to be parsed with the matching
+    tool call format. The token that ends the last message is usually a stop
+    token and never arrives in the text; finish() closes an open tool
+    message.
     """
 
     _HEADER = "header"
     _BODY = "body"
+
+    # Subclass interface
+    _TOKENS: List[str]
+    _TOOL_END: str
+
+    def _resolve_channel(self, header: str) -> str:
+        """Map a message header to a channel."""
+        raise NotImplementedError
 
     def __init__(self):
         self._state = self._HEADER
@@ -196,10 +216,9 @@ class HarmonyStreamParser:
         # True if any structural token was matched during the last feed() call
         self.saw_tag = False
 
-        tokens = ["<|start|>", "<|message|>", "<|end|>", "<|return|>", "<|call|>"]
-        self._tokens = tokens
-        self._token_re = re.compile("|".join(re.escape(t) for t in tokens))
-        self._max_hold = max(len(t) for t in tokens) - 1
+        self._token_re = re.compile("|".join(re.escape(t) for t in self._TOKENS))
+        self._max_hold = max(len(t) for t in self._TOKENS) - 1
+        self._token_first = frozenset(t[0] for t in self._TOKENS)
 
     @property
     def in_reasoning(self) -> bool:
@@ -242,15 +261,15 @@ class HarmonyStreamParser:
     def finish(self) -> List[Tuple[str, str]]:
         """
         Flush held text at the end of generation. An open tool message is
-        terminated: generation stopped at the `<|call|>` stop token, which is
-        not part of the text.
+        terminated: generation stopped at a stop token, which is not part of
+        the text.
         """
 
         events = []
         self._route(self._pending, events)
         self._pending = ""
         if self.in_tool:
-            events.append((TOOL, "<|call|>"))
+            events.append((TOOL, self._TOOL_END))
             self._state = self._HEADER
             self._header = ""
         return _merge_events(events)
@@ -258,13 +277,7 @@ class HarmonyStreamParser:
     def _partial_token_len(self) -> int:
         """Length of the longest pending suffix that could still become a token."""
 
-        limit = min(self._max_hold, len(self._pending))
-        for k in range(limit, 0, -1):
-            tail = self._pending[-k:]
-            for token in self._tokens:
-                if token.startswith(tail):
-                    return k
-        return 0
+        return _partial_token_len(self._pending, self._TOKENS, self._token_first, self._max_hold)
 
     def _route(self, text: str, events: list):
         """Append text to the header or the currently active channel."""
@@ -286,23 +299,81 @@ class HarmonyStreamParser:
                 self._state = self._BODY
             return
 
-        # <|start|>, <|end|>, <|return|>, <|call|> all begin a new message
-        # header. A stray <|start|> or end token inside a header discards it.
+        # Every other structural token begins a new message header. A stray
+        # <|start|> or end token inside a header discards it.
         if self._state == self._BODY and self._channel == TOOL:
-            events.append((TOOL, "<|call|>"))
+            events.append((TOOL, self._TOOL_END))
         self._state = self._HEADER
         self._header = ""
+
+
+class HarmonyStreamParser(ChannelStreamParser):
+    """
+    Splits generated text in the Harmony format (gpt-oss) into
+    reasoning/content/tool channels.
+
+    Message bodies end with `<|end|>` (another message follows), `<|return|>`
+    (end of the response) or `<|call|>` (tool call). The header carries the
+    channel and, for tool calls, a recipient:
+
+        <|channel|>analysis<|message|>...reasoning...<|end|>
+        <|start|>assistant<|channel|>final<|message|>...content...<|return|>
+        <|channel|>commentary to=functions.name <|constrain|>json<|message|>{...}<|call|>
+
+    Routing: any message with a recipient -> tool, analysis -> reasoning,
+    final and commentary preambles -> content. Tool messages are parsed with
+    the "harmony" tool format.
+    """
+
+    _TOKENS = ["<|start|>", "<|message|>", "<|end|>", "<|return|>", "<|call|>"]
+    _TOOL_END = "<|call|>"
 
     def _resolve_channel(self, header: str) -> str:
         channel = re.search(r"<\|channel\|>\s*(\w+)", header)
         channel = channel.group(1) if channel else None
         recipient = re.search(r"\bto=\S+", header)
 
+        # A recipient means the message is addressed to a tool, regardless of
+        # channel: function calls normally ride the commentary channel, but
+        # gpt-oss also emits them on analysis (the Harmony spec calls
+        # built-in tools from there)
+        if recipient:
+            return TOOL
         if channel == "analysis":
             return REASONING
-        if channel == "commentary" and recipient:
-            return TOOL
         # "final", commentary preambles, and anything unrecognized
+        return CONTENT
+
+
+class GlimmerStreamParser(ChannelStreamParser):
+    """
+    Splits generated text in the Muse Glimmer format into
+    reasoning/content/tool channels.
+
+    Message bodies end with `<|eom|>` (another message follows) or `<|eot|>`
+    (end of the turn). The header carries an optional recipient:
+
+        <|start|>assistant to=self<|message|>...reasoning...<|eom|>
+        <|start|>assistant to=user<|message|>...content...<|eot|>
+        <|start|>assistant to=tool.name<|message|><atem:function_calls>...<|eot|>
+
+    Routing: `to=self` -> reasoning, `to=user` or no recipient -> content,
+    any other recipient -> tool. Tool messages are parsed with the
+    "muse_glimmer" tool format.
+    """
+
+    _TOKENS = ["<|start|>", "<|message|>", "<|eom|>", "<|eot|>"]
+    _TOOL_END = "<|eom|>"
+
+    def _resolve_channel(self, header: str) -> str:
+        recipient = re.search(r"\bto=([^\s<]+)", header)
+        recipient = recipient.group(1) if recipient else None
+
+        if recipient == "self":
+            return REASONING
+        if recipient and recipient != "user":
+            return TOOL
+        # to=user and messages without a recipient
         return CONTENT
 
 
