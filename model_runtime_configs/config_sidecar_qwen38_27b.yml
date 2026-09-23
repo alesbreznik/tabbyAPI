@@ -1,0 +1,109 @@
+# TabbyAPI Runtime Configuration for Qwen3.8-27B (EXL3 4.85 bpw + Multimodal Vision)
+# Assigned Port: 50011 (Proxied by Watchdog Broker to Public Port 5001 as local_model_2)
+# Device Mapping:
+#   Device 0 = RTX 4080 Super 16GB: 0.0 GB (Zero Spillover)
+#   Device 1 = RTX 4000 Ada #1 20GB: 0.0 GB
+#   Device 2 = RTX 4000 Ada #2 20GB: ~19.55 GB Saturated (95.5% Static -> 98.2% Dynamic Saturation, 72k "8,4" KV Cache + Vision)
+
+network:
+  host: 127.0.0.1
+  port: 50011                      # Proxied by Watchdog Broker to Public Port 5001
+  disable_auth: false
+  disable_fetch_requests: false
+  send_tracebacks: false
+  api_servers: ["OAI"]
+
+logging:
+  log_prompt: false
+  log_generation_params: false
+  log_requests: false
+  log_chat_completion_requests: false
+
+model:
+  model_dir: models
+  inline_model_loading: false
+  use_dummy_models: true
+  dummy_model_names:
+    - "local_model_2"
+    - "qwen3.8-27b"
+    - "Qwen3.8-27B"
+    - "Qwen3.8-27B-exl3-4.85bpw-vl"
+    - "reasoner-verifier"
+    - "qwq-32b"                     # Backward compatibility alias
+    - "QwQ-32B"
+    - "deepseek-r1-32b"             # Backward compatibility alias
+    - "DeepSeek-R1-Distill-Qwen-32B-exl3-4.25bpw"
+
+  model_name: Qwen3.8-27B-exl3-4.85bpw-vl
+  backend: exllamav3
+
+  # Context Architecture: 73,728 tokens (72k context) with 8-bit Key, 4-bit Value ("8,4") KV Cache
+  # Because 48/64 layers are DeltaNet (fixed ~72MB recurrent state), expanding KV is only 16 layers (24 KiB/token)
+  # 72k context KV Cache = 1,728 MiB. Total VRAM ~19.55 GB / 20.47 GB (95.5% static -> 98.2% peak saturation)
+  max_seq_len: 73728
+  cache_size: 73728
+  cache_mode: "8,4"
+  chunk_size: 2048
+  output_chunking: true            # Allocates generation buffers dynamically; prevents sudden OOM on long traces
+  max_batch_size: 1
+
+  # Memory Split across visible devices (Device 0 = 4080S, Device 1 = Ada #1, Device 2 = Ada #2)
+  tensor_parallel: false
+  gpu_split_auto: false
+  gpu_split: [0.0, 0.0, 20.0]      # 100% Dedicated to Ada #2 (20,475 MiB), 0.0 GB on 4080S
+
+  # Architectural Calibration
+  rope_scale: 1.0                  # Native RoPE handles up to 262k tokens
+
+  # Chat & Structured Reasoning Extraction
+  prompt_template: chatml.jinja
+  reasoning: true
+  reasoning_start_token: "<think>"
+  reasoning_end_token: "</think>"
+  start_in_reasoning: auto
+  tool_calls_in_reasoning: true
+
+  # Multimodal Vision
+  vision: true
+
+  # Native Multi-Turn Reasoning & Thinking Preservation
+  template_vars_default:
+    enable_thinking: true
+    preserve_thinking: true
+    reasoning_effort: "high"
+
+  use_as_default:
+    - max_seq_len
+    - cache_mode
+    - chunk_size
+    - output_chunking
+    - prompt_template
+    - reasoning
+    - template_vars_default
+    - vision
+
+# Speculative Decoding: Native 1-layer Multi-Token Prediction (MTP)
+draft_model:
+  draft_mode: mtp
+  draft_num_tokens: 3
+  draft_cache_mode: "8,4"
+  draft_gpu_split: [0.0, 0.0, 20.0]
+
+sampling:
+  temperature: 0.6                 # Optimal for deep CoT without repetition
+  top_p: 0.95
+  min_p: 0.05                      # Prunes unstable low-probability branches during deep CoT
+  repetition_penalty: 1.0          # Keep strictly at 1.0 to preserve syntax/brackets
+
+stop:
+  - "<|im_end|>"
+  - "<|endoftext|>"
+
+memory:
+  cuda_malloc_async: true
+
+developer:
+  unsafe_launch: false
+  disable_request_streaming: false
+  realtime_process_priority: true
+  log_level: INFO

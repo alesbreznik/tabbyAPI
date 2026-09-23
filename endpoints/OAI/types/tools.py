@@ -7,8 +7,8 @@ class Function(BaseModel):
     """Represents a description of a tool function."""
 
     name: str
-    description: str
-    parameters: Dict[str, object]
+    description: Optional[str] = ""
+    parameters: Optional[Dict[str, object]] = Field(default_factory=dict)
 
 
 class ToolSpec(BaseModel):
