@@ -38,12 +38,11 @@ model:
   backend: exllamav3
 
   # Context Architecture: 73,728 tokens (72k context) with 8-bit Key, 4-bit Value ("8,4") KV Cache
-  # Because 48/64 layers are DeltaNet (fixed ~72MB recurrent state), expanding KV is only 16 layers (24 KiB/token)
-  # 72k context KV Cache = 1,728 MiB. Total VRAM ~19.55 GB / 20.47 GB (95.5% static -> 98.2% peak saturation)
+  # Maximizes Ada #2 saturation (~95.0% static) with chunk_size 1024 for stable HGEMM prefill
   max_seq_len: 73728
   cache_size: 73728
   cache_mode: "8,4"
-  chunk_size: 2048
+  chunk_size: 1024
   output_chunking: true            # Allocates generation buffers dynamically; prevents sudden OOM on long traces
   max_batch_size: 1
 
